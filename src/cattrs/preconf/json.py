@@ -12,6 +12,7 @@ from ..fns import identity
 from ..literals import is_literal_containing_enums
 from ..strategies import configure_union_passthrough
 from . import is_primitive_enum, literals_with_enums_unstructure_factory, wrap
+from ._json import make_structure_mapping_factory, make_unstructure_mapping_factory
 
 __all__ = ["JsonConverter", "configure_converter", "make_converter"]
 
@@ -26,7 +27,9 @@ class JsonConverter(Converter):
         return self.structure(loads(data, **kwargs), cl)
 
 
-def configure_converter(converter: BaseConverter) -> None:
+def configure_converter(
+    converter: BaseConverter, preserve_mapping_keys: bool = False
+) -> None:
     """
     Configure the converter for use with the stdlib json module.
 
@@ -37,6 +40,7 @@ def configure_converter(converter: BaseConverter) -> None:
     * string and int enums are passed through when unstructuring
     * union passthrough is configured for unions of strings, bools, ints,
       floats and None
+    * typed mapping keys can be JSON-encoded and losslessly reconstructed
 
     .. versionchanged:: 24.2.0
         Enums are left to the library to unstructure, speeding them up.
@@ -55,15 +59,25 @@ def configure_converter(converter: BaseConverter) -> None:
     converter.register_unstructure_hook_func(is_primitive_enum, identity)
     configure_union_passthrough(Union[str, bool, int, float, None], converter)
 
+    if preserve_mapping_keys:
+        converter.register_unstructure_hook_factory(
+            is_mapping, make_unstructure_mapping_factory(dumps)
+        )
+        converter.register_structure_hook_factory(
+            is_mapping, make_structure_mapping_factory(loads)
+        )
+
 
 @wrap(JsonConverter)
-def make_converter(*args: Any, **kwargs: Any) -> JsonConverter:
+def make_converter(
+    *args: Any, preserve_mapping_keys: bool = False, **kwargs: Any
+) -> JsonConverter:
     kwargs["unstruct_collection_overrides"] = {
         Set: list,
         Counter: dict,
         **kwargs.get("unstruct_collection_overrides", {}),
     }
     res = JsonConverter(*args, **kwargs)
-    configure_converter(res)
+    configure_converter(res, preserve_mapping_keys=preserve_mapping_keys)
 
     return res

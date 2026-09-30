@@ -5,6 +5,7 @@ from collections.abc import Set
 from datetime import date, datetime
 from enum import Enum
 from functools import partial
+from json import loads as json_loads
 from typing import Any, TypeVar, Union
 
 from orjson import dumps, loads
@@ -16,6 +17,7 @@ from ..fns import identity
 from ..literals import is_literal_containing_enums
 from ..strategies import configure_union_passthrough
 from . import is_primitive_enum, literals_with_enums_unstructure_factory, wrap
+from ._json import make_structure_mapping_factory, make_unstructure_mapping_factory
 
 __all__ = ["OrjsonConverter", "configure_converter", "make_converter"]
 
@@ -30,7 +32,9 @@ class OrjsonConverter(Converter):
         return self.structure(loads(data), cl)
 
 
-def configure_converter(converter: Converter) -> None:
+def configure_converter(
+    converter: Converter, preserve_mapping_keys: bool = False
+) -> None:
     """
     Configure the converter for use with the orjson library.
 
@@ -40,6 +44,7 @@ def configure_converter(converter: Converter) -> None:
     * sets are serialized as lists
     * string enum mapping keys have special handling
     * mapping keys are coerced into strings when unstructuring
+    * typed mapping keys can instead be JSON-encoded and losslessly reconstructed
     * bare, string and int enums are passed through when unstructuring
 
     .. versionchanged:: 24.1.0
@@ -58,7 +63,7 @@ def configure_converter(converter: Converter) -> None:
     def unstructure_mapping_factory(cl: Any, unstructure_to=None):
         key_handler = str
         args = getattr(cl, "__args__", None)
-        if args:
+        if args and not preserve_mapping_keys:
             if is_subclass(args[0], str) and is_subclass(args[0], Enum):
 
                 def key_handler(v):
@@ -74,19 +79,29 @@ def configure_converter(converter: Converter) -> None:
                     key_handler = kh
 
         return converter.gen_unstructure_mapping(
-            cl, unstructure_to=unstructure_to, key_handler=key_handler
+            cl,
+            unstructure_to=unstructure_to,
+            key_handler=key_handler,
+            key_encoder=None,
+            check_key_collisions=False,
         )
 
-    converter._unstructure_func.register_func_list(
-        [
-            (is_mapping, unstructure_mapping_factory, True),
-            (
-                is_namedtuple,
-                partial(namedtuple_unstructure_factory, unstructure_to=tuple),
-                "extended",
-            ),
-        ]
+    def encode_key(value: Any) -> str:
+        return dumps(value).decode("utf-8")
+
+    converter.register_unstructure_hook_factory(
+        is_mapping,
+        make_unstructure_mapping_factory(encode_key)
+        if preserve_mapping_keys
+        else unstructure_mapping_factory,
     )
+    converter.register_unstructure_hook_factory(
+        is_namedtuple, partial(namedtuple_unstructure_factory, unstructure_to=tuple)
+    )
+    if preserve_mapping_keys:
+        converter.register_structure_hook_factory(
+            is_mapping, make_structure_mapping_factory(json_loads)
+        )
     converter.register_unstructure_hook_func(
         partial(is_primitive_enum, include_bare_enums=True), identity
     )
@@ -97,12 +112,14 @@ def configure_converter(converter: Converter) -> None:
 
 
 @wrap(OrjsonConverter)
-def make_converter(*args: Any, **kwargs: Any) -> OrjsonConverter:
+def make_converter(
+    *args: Any, preserve_mapping_keys: bool = False, **kwargs: Any
+) -> OrjsonConverter:
     kwargs["unstruct_collection_overrides"] = {
         Set: list,
         **kwargs.get("unstruct_collection_overrides", {}),
     }
     res = OrjsonConverter(*args, **kwargs)
-    configure_converter(res)
+    configure_converter(res, preserve_mapping_keys=preserve_mapping_keys)
 
     return res

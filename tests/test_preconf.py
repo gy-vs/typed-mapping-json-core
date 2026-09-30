@@ -43,6 +43,7 @@ from cattrs._compat import (
     Sequence,
     TupleSubscriptable,
 )
+from cattrs.errors import IterableValidationError
 from cattrs.fns import identity
 from cattrs.preconf.bson import make_converter as bson_make_converter
 from cattrs.preconf.cbor2 import make_converter as cbor2_make_converter
@@ -68,6 +69,18 @@ class B:
 
 class C(NamedTuple):
     c: float
+
+
+@define(frozen=True)
+class Coordinate:
+    x: int
+    y: int
+
+
+@define
+class CoordinateRecord:
+    name: str
+    values: Dict[Coordinate, int]
 
 
 @define
@@ -305,6 +318,65 @@ def test_stdlib_json_converter_unstruct_collection_overrides(everything: Everyth
     assert raw["a_frozenset"] == sorted(raw["a_frozenset"])
 
 
+@pytest.mark.parametrize("detailed_validation", [True, False])
+def test_stdlib_json_preserves_typed_mapping_keys(detailed_validation: bool):
+    converter = json_make_converter(
+        preserve_mapping_keys=True, detailed_validation=detailed_validation
+    )
+    converter.register_unstructure_hook(
+        Coordinate, lambda coordinate: [coordinate.x, coordinate.y]
+    )
+    converter.register_structure_hook(
+        Coordinate, lambda value, _: Coordinate(value[0], value[1])
+    )
+    record = CoordinateRecord(
+        "measurements",
+        {Coordinate(1, 2): 3, Coordinate(4, 5): 6},
+    )
+
+    raw = json_loads(converter.dumps(record))
+
+    assert raw["values"] == {"[1, 2]": 3, "[4, 5]": 6}
+    assert converter.loads(converter.dumps(record), CoordinateRecord) == record
+    assert converter.structure(
+        converter.unstructure({Coordinate(0, 1): 2}, Dict[Coordinate, int]),
+        Dict[Coordinate, int],
+    ) == {Coordinate(0, 1): 2}
+
+
+def test_stdlib_json_typed_key_collisions_are_structuring_errors():
+    converter = json_make_converter(preserve_mapping_keys=True)
+
+    with pytest.raises(IterableValidationError) as exc_info:
+        converter.structure({"01": 1, "1": 2}, Dict[int, int])
+
+    assert "'01'" in str(exc_info.value.exceptions[0])
+    assert "'1'" in str(exc_info.value.exceptions[0])
+    assert "Structuring mapping key @ key '1'" in (
+        exc_info.value.exceptions[0].__notes__[0]
+    )
+
+
+def test_stdlib_json_typed_key_collisions_are_unstructuring_errors():
+    converter = json_make_converter(preserve_mapping_keys=True)
+
+    with pytest.raises(ValueError, match="True.*1"):
+        converter.unstructure([(1, "one"), (True, "true")], Dict[int, str])
+
+
+def test_stdlib_json_does_not_change_plain_mapping_keys():
+    record = CoordinateRecord(
+        "measurements",
+        {Coordinate(1, 2): 3, Coordinate(4, 5): 6},
+    )
+    converter = json_make_converter()
+    raw = converter.unstructure({"a": 1})
+
+    assert raw == {"a": 1}
+    with pytest.raises(TypeError):
+        converter.dumps(record)
+
+
 @given(
     union_and_val=native_unions(include_bytes=False, include_datetimes=False),
     detailed_validation=...,
@@ -468,6 +540,54 @@ def test_orjson_converter(everything: Everything, detailed_validation: bool):
     converter = orjson_make_converter(detailed_validation=detailed_validation)
     raw = converter.dumps(everything)
     assert converter.loads(raw, Everything) == everything
+
+
+@pytest.mark.skipif(NO_ORJSON, reason="orjson not available")
+@pytest.mark.parametrize("detailed_validation", [True, False])
+def test_orjson_preserves_typed_mapping_keys(detailed_validation: bool):
+    from cattrs.preconf.orjson import make_converter as orjson_make_converter
+
+    converter = orjson_make_converter(
+        preserve_mapping_keys=True, detailed_validation=detailed_validation
+    )
+    converter.register_unstructure_hook(
+        Coordinate, lambda coordinate: [coordinate.x, coordinate.y]
+    )
+    converter.register_structure_hook(
+        Coordinate, lambda value, _: Coordinate(value[0], value[1])
+    )
+    record = CoordinateRecord(
+        "measurements",
+        {Coordinate(1, 2): 3, Coordinate(4, 5): 6},
+    )
+
+    raw = json_loads(converter.dumps(record))
+
+    assert raw["values"] == {"[1,2]": 3, "[4,5]": 6}
+    assert converter.loads(converter.dumps(record), CoordinateRecord) == record
+
+
+@pytest.mark.skipif(NO_ORJSON, reason="orjson not available")
+def test_orjson_typed_key_collisions_are_structuring_errors():
+    from cattrs.preconf.orjson import make_converter as orjson_make_converter
+
+    converter = orjson_make_converter(preserve_mapping_keys=True)
+
+    with pytest.raises(IterableValidationError) as exc_info:
+        converter.structure({"01": 1, "1": 2}, Dict[int, int])
+
+    assert "'01'" in str(exc_info.value.exceptions[0])
+    assert "'1'" in str(exc_info.value.exceptions[0])
+
+
+@pytest.mark.skipif(NO_ORJSON, reason="orjson not available")
+def test_orjson_typed_key_collisions_are_unstructuring_errors():
+    from cattrs.preconf.orjson import make_converter as orjson_make_converter
+
+    converter = orjson_make_converter(preserve_mapping_keys=True)
+
+    with pytest.raises(ValueError, match="True.*1"):
+        converter.unstructure([(1, "one"), (True, "true")], Dict[int, str])
 
 
 @pytest.mark.skipif(NO_ORJSON, reason="orjson not available")

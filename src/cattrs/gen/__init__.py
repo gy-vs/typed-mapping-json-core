@@ -846,11 +846,17 @@ def mapping_unstructure_factory(
     converter: BaseConverter,
     unstructure_to: Any = None,
     key_handler: Callable[[Any, Any | None], Any] | None = None,
+    key_encoder: Callable[[Any], str] | None = None,
+    check_key_collisions: bool = False,
 ) -> MappingUnstructureFn:
     """Generate a specialized unstructure function for a mapping.
 
     :param unstructure_to: The class to unstructure to; defaults to the
         same class as the mapping being unstructured.
+    :param key_encoder: An optional callable converting unstructured keys to
+        the output mapping's key type.
+    :param check_key_collisions: Whether to detect multiple input keys mapping
+        to the same output key.
     """
     kh = key_handler or converter.unstructure
     val_handler = converter.unstructure
@@ -868,7 +874,7 @@ def mapping_unstructure_factory(
             key_arg, val_arg = args, Any
         # We can do the dispatch here and now.
         kh = key_handler or converter.get_unstructure_hook(key_arg, cache_result=False)
-        if kh == identity:
+        if kh == identity and key_encoder is None:
             kh = None
 
         val_handler = converter.get_unstructure_hook(val_arg, cache_result=False)
@@ -877,6 +883,16 @@ def mapping_unstructure_factory(
 
         origin = get_origin(cl)
 
+    if key_encoder is not None:
+        unstructured_key_handler = kh if kh is not None else identity
+
+        def kh(
+            k: Any,
+            _handler: Callable[[Any], Any] = unstructured_key_handler,
+            _encoder: Callable[[Any], str] = key_encoder,
+        ) -> str:
+            return _encoder(_handler(k))
+
     globs = {"__cattr_k_u": kh, "__cattr_v_u": val_handler}
 
     k_u = "__cattr_k_u(k)" if kh is not None else "k"
@@ -884,7 +900,25 @@ def mapping_unstructure_factory(
 
     lines = [f"def {fn_name}(mapping):"]
 
-    if unstructure_to is dict or (unstructure_to is None and origin is dict):
+    if check_key_collisions:
+        globs["__cattr_mapping_cl"] = unstructure_to or cl
+        lines.extend(
+            [
+                "    res = {}",
+                "    unstructured_keys = {}",
+                "    for k, v in mapping.items():",
+                f"        unstructured_key = {k_u}",
+                "        if unstructured_key in res:",
+                "            raise ValueError(",
+                '                f"Mapping keys {k!r} and {unstructured_keys[unstructured_key]!r} '\
+                'both unstructure to {unstructured_key!r}"',
+                "            )",
+                f"        res[unstructured_key] = {v_u}",
+                "        unstructured_keys[unstructured_key] = k",
+                "    return __cattr_mapping_cl(res)",
+            ]
+        )
+    elif unstructure_to is dict or (unstructure_to is None and origin is dict):
         if kh is None and val_handler is None:
             # Simplest path.
             return dict
@@ -914,6 +948,8 @@ def mapping_structure_factory(
     key_type=NOTHING,
     val_type=NOTHING,
     detailed_validation: bool | Literal["from_converter"] = "from_converter",
+    key_decoder: Callable[[str], Any] | None = None,
+    check_key_collisions: bool = False,
 ) -> SimpleStructureHook[Mapping[Any, Any], T]:
     """Generate a specialized structure function for a mapping."""
     fn_name = "structure_mapping"
@@ -921,7 +957,7 @@ def mapping_structure_factory(
     if detailed_validation == "from_converter":
         detailed_validation = converter.detailed_validation
 
-    globs: dict[str, type] = {"__cattr_mapping_cl": structure_to}
+    globs: dict[str, Any] = {"__cattr_mapping_cl": structure_to}
 
     lines = []
     internal_arg_parts = {}
@@ -960,10 +996,13 @@ def mapping_structure_factory(
             globs["__cattr_v_t"] = val_type
             globs["__cattr_k_s"] = key_handler
             globs["__cattr_v_s"] = val_handler
+            if key_decoder is not None:
+                globs["__cattr_k_d"] = key_decoder
+            raw_k_s = "__cattr_k_d(k)" if key_decoder is not None else "k"
             k_s = (
-                "__cattr_k_s(k, __cattr_k_t)"
+                f"__cattr_k_s({raw_k_s}, __cattr_k_t)"
                 if key_handler != key_type
-                else "__cattr_k_s(k)"
+                else f"__cattr_k_s({raw_k_s})"
             )
             v_s = (
                 "__cattr_v_s(v, __cattr_v_t)"
@@ -989,6 +1028,8 @@ def mapping_structure_factory(
             globs["enumerate"] = enumerate
 
             lines.append("  res = {}; errors = []")
+            if check_key_collisions:
+                lines.append("  structured_keys = {}")
             lines.append("  for k, v in mapping.items():")
             lines.append("    try:")
             lines.append(f"      value = {v_s}")
@@ -1000,7 +1041,14 @@ def mapping_structure_factory(
             lines.append("      continue")
             lines.append("    try:")
             lines.append(f"      key = {k_s}")
+            if check_key_collisions:
+                lines.append("      if key in res:")
+                lines.append(
+                    "        raise ValueError(f'Mapping keys {k!r} and {structured_keys[key]!r} both structure to {key!r}')"
+                )
             lines.append("      res[key] = value")
+            if check_key_collisions:
+                lines.append("      structured_keys[key] = k")
             lines.append("    except Exception as e:")
             lines.append(
                 "      e.__notes__ = getattr(e, '__notes__', []) + [IterableValidationNote(f'Structuring mapping key @ key {k!r}', k, key_type)]"
@@ -1009,6 +1057,20 @@ def mapping_structure_factory(
             lines.append("  if errors:")
             lines.append(
                 f"    raise IterableValidationError('While structuring ' + {repr(cl)!r}, errors, __cattr_mapping_cl)"
+            )
+        elif check_key_collisions:
+            lines.extend(
+                [
+                    "  res = {}",
+                    "  structured_keys = {}",
+                    "  for k, v in mapping.items():",
+                    f"    value = {v_s}",
+                    f"    key = {k_s}",
+                    "    if key in res:",
+                    "      raise ValueError(f'Mapping keys {k!r} and {structured_keys[key]!r} both structure to {key!r}')",
+                    "    res[key] = value",
+                    "    structured_keys[key] = k",
+                ]
             )
         else:
             lines.append(f"  res = {{{k_s}: {v_s} for k, v in mapping.items()}}")

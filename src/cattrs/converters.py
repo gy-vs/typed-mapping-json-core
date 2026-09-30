@@ -1347,12 +1347,19 @@ class Converter(BaseConverter):
         cl: Any,
         unstructure_to: Any = None,
         key_handler: Callable[[Any, Any | None], Any] | None = None,
+        key_encoder: Callable[[Any], str] | None = None,
+        check_key_collisions: bool = False,
     ) -> MappingUnstructureFn:
         unstructure_to = self._unstruct_collection_overrides.get(
             get_origin(cl) or cl, unstructure_to or dict
         )
         h = mapping_unstructure_factory(
-            cl, self, unstructure_to=unstructure_to, key_handler=key_handler
+            cl,
+            self,
+            unstructure_to=unstructure_to,
+            key_handler=key_handler,
+            key_encoder=key_encoder,
+            check_key_collisions=check_key_collisions,
         )
         self._unstructure_func.register_cls_list([(cl, h)], direct=True)
         return h
