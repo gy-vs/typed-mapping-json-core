@@ -1045,6 +1045,7 @@ class Converter(BaseConverter):
     __slots__ = (
         "_unstruct_collection_overrides",
         "forbid_extra_keys",
+        "lossless_mapping_keys",
         "omit_if_default",
         "type_overrides",
         "use_alias",
@@ -1065,6 +1066,8 @@ class Converter(BaseConverter):
             None, t
         ),
         use_alias: bool = False,
+        *,
+        lossless_mapping_keys: bool = False,
     ):
         """
         :param detailed_validation: Whether to use a slightly slower mode for detailed
@@ -1075,6 +1078,8 @@ class Converter(BaseConverter):
             registered structuring hooks match.
         :param use_alias: Whether to use the field alias instead of the field name as
             the un/structured dictionary key by default.
+        :param lossless_mapping_keys: Encode typed non-string mapping keys as
+            JSON strings, and check for collisions when un/structuring mappings.
 
         ..  versionadded:: 23.2.0 *unstructure_fallback_factory*
         ..  versionadded:: 23.2.0 *structure_fallback_factory*
@@ -1082,6 +1087,7 @@ class Converter(BaseConverter):
             The default `structure_fallback_factory` now raises errors for missing handlers
             more eagerly, surfacing problems earlier.
         ..  versionadded:: 25.2.0 *use_alias*
+        ..  versionadded:: 25.3.0 *lossless_mapping_keys*
         """
         super().__init__(
             dict_factory=dict_factory,
@@ -1095,6 +1101,7 @@ class Converter(BaseConverter):
         self.forbid_extra_keys = forbid_extra_keys
         self.type_overrides = dict(type_overrides)
         self.use_alias = use_alias
+        self.lossless_mapping_keys = lossless_mapping_keys
 
         unstruct_collection_overrides = {
             get_origin(k) or k: v for k, v in unstruct_collection_overrides.items()
@@ -1352,7 +1359,11 @@ class Converter(BaseConverter):
             get_origin(cl) or cl, unstructure_to or dict
         )
         h = mapping_unstructure_factory(
-            cl, self, unstructure_to=unstructure_to, key_handler=key_handler
+            cl,
+            self,
+            unstructure_to=unstructure_to,
+            key_handler=key_handler,
+            lossless_keys=self.lossless_mapping_keys,
         )
         self._unstructure_func.register_cls_list([(cl, h)], direct=True)
         return h
@@ -1366,6 +1377,7 @@ class Converter(BaseConverter):
             structure_to=Counter,
             val_type=int,
             detailed_validation=self.detailed_validation,
+            lossless_keys=self.lossless_mapping_keys,
         )
         self._structure_func.register_cls_list([(cl, h)], direct=True)
         return h
@@ -1382,7 +1394,11 @@ class Converter(BaseConverter):
         ):  # These default to dicts
             structure_to = dict
         h = mapping_structure_factory(
-            cl, self, structure_to, detailed_validation=self.detailed_validation
+            cl,
+            self,
+            structure_to,
+            detailed_validation=self.detailed_validation,
+            lossless_keys=self.lossless_mapping_keys,
         )
         self._structure_func.register_cls_list([(cl, h)], direct=True)
         return h
@@ -1398,6 +1414,8 @@ class Converter(BaseConverter):
         prefer_attrib_converters: bool | None = None,
         detailed_validation: bool | None = None,
         use_alias: bool | None = None,
+        *,
+        lossless_mapping_keys: bool | None = None,
     ) -> Self:
         """Create a copy of the converter, keeping all existing custom hooks.
 
@@ -1438,6 +1456,11 @@ class Converter(BaseConverter):
                 else self.detailed_validation
             ),
             use_alias=(use_alias if use_alias is not None else self.use_alias),
+            lossless_mapping_keys=(
+                lossless_mapping_keys
+                if lossless_mapping_keys is not None
+                else self.lossless_mapping_keys
+            ),
         )
 
         self._unstructure_func.copy_to(

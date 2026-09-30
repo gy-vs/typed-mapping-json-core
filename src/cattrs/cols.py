@@ -356,5 +356,8 @@ def defaultdict_structure_factory(
     if default_factory is NOTHING:
         default_factory = get_args(type)[1]
     return mapping_structure_factory(
-        type, converter, partial(defaultdict, default_factory)
+        type,
+        converter,
+        partial(defaultdict, default_factory),
+        lossless_keys="from_converter",
     )

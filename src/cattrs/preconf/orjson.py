@@ -39,7 +39,8 @@ def configure_converter(converter: Converter) -> None:
     * typed namedtuples are serialized as lists
     * sets are serialized as lists
     * string enum mapping keys have special handling
-    * mapping keys are coerced into strings when unstructuring
+    * typed mapping keys are losslessly encoded as strings when
+      ``lossless_mapping_keys`` is enabled
     * bare, string and int enums are passed through when unstructuring
 
     .. versionchanged:: 24.1.0
@@ -56,6 +57,11 @@ def configure_converter(converter: Converter) -> None:
     converter.register_structure_hook(date, lambda v, _: date.fromisoformat(v))
 
     def unstructure_mapping_factory(cl: Any, unstructure_to=None):
+        if getattr(converter, "lossless_mapping_keys", False) and getattr(
+            cl, "__args__", None
+        ):
+            return converter.gen_unstructure_mapping(cl, unstructure_to=unstructure_to)
+
         key_handler = str
         args = getattr(cl, "__args__", None)
         if args:

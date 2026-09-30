@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import re
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Final, Literal, TypeVar
 
 from attrs import NOTHING, Attribute, Factory
@@ -12,11 +15,13 @@ from .._compat import (
     TypeAlias,
     adapted_fields,
     get_args,
+    get_newtype_base,
     get_origin,
     is_annotated,
     is_bare,
     is_bare_final,
     is_generic,
+    is_subclass,
 )
 from .._generics import deep_copy_with
 from ..dispatch import UnstructureHook
@@ -26,6 +31,7 @@ from ..errors import (
     ForbiddenExtraKeysError,
     IterableValidationError,
     IterableValidationNote,
+    MappingKeyCollisionError,
     StructureHandlerNotFoundError,
 )
 from ..fns import identity
@@ -840,42 +846,168 @@ def make_hetero_tuple_unstructure_fn(
 MappingUnstructureFn = Callable[[Mapping[Any, Any]], Any]
 
 
+def _load_json_key(value: str) -> Any:
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
+
+
 # This factory is here for backwards compatibility and circular imports.
 def mapping_unstructure_factory(
     cl: Any,
     converter: BaseConverter,
     unstructure_to: Any = None,
     key_handler: Callable[[Any, Any | None], Any] | None = None,
+    lossless_keys: bool | Literal["from_converter"] = False,
 ) -> MappingUnstructureFn:
     """Generate a specialized unstructure function for a mapping.
 
     :param unstructure_to: The class to unstructure to; defaults to the
         same class as the mapping being unstructured.
     """
-    kh = key_handler or converter.unstructure
+    if lossless_keys == "from_converter":
+        lossless_keys = getattr(converter, "lossless_mapping_keys", False)
+
+    kh = key_handler
+    key_arg = Any
+    key_base = Any
+    lossless_key_arg = Any
+    if kh is None and getattr(cl, "__args__", None) is not None:
+        key_arg = get_args(cl)[0]
+        kh = converter.get_unstructure_hook(key_arg, cache_result=False)
+    if kh == identity:
+        kh = None
     val_handler = converter.unstructure
 
     fn_name = "unstructure_mapping"
     origin = cl
 
-    # Let's try fishing out the type args.
+    # Let's try fishing out the value type args.
     if getattr(cl, "__args__", None) is not None:
         args = get_args(cl)
         if len(args) == 2:
             key_arg, val_arg = args
+        elif get_origin(cl) is Counter:
+            (key_arg,), val_arg = args, int
         else:
             # Probably a Counter
-            key_arg, val_arg = args, Any
-        # We can do the dispatch here and now.
-        kh = key_handler or converter.get_unstructure_hook(key_arg, cache_result=False)
-        if kh == identity:
-            kh = None
+            key_arg, val_arg = (args[0], Any)
+        lossless_key_arg = (
+            key_arg
+            if lossless_keys and (len(args) == 2 or get_origin(cl) is Counter)
+            else Any
+        )
+        key_base = get_newtype_base(key_arg) or key_arg
+        if key_handler is None:
+            kh = converter.get_unstructure_hook(key_arg, cache_result=False)
+            if kh == identity:
+                kh = None
 
         val_handler = converter.get_unstructure_hook(val_arg, cache_result=False)
         if val_handler == identity:
             val_handler = None
-
         origin = get_origin(cl)
+
+    key_base_is_str = is_subclass(key_base, str)
+    if lossless_keys and key_handler is None:
+        string_enum_key = is_subclass(key_base, str) and is_subclass(key_arg, Enum)
+        if (
+            not is_bare(cl)
+            and lossless_key_arg not in ANIES
+            and (not key_base_is_str or string_enum_key)
+        ):
+            # Typed non-string keys are encoded with their registered hook, and
+            # then JSON-encoded so the resulting mapping has string keys.
+            typed_key_handler = converter.get_unstructure_hook(
+                key_arg, cache_result=False
+            )
+
+            def kh(
+                key,
+                _handler=typed_key_handler,
+                _string_enum_key=string_enum_key,
+            ):
+                if _string_enum_key:
+                    return key.value if _handler == identity else _handler(key)
+                if _handler == identity:
+                    unstructured_key = key.value if isinstance(key, Enum) else key
+                else:
+                    unstructured_key = _handler(key)
+                return json.dumps(unstructured_key, separators=(",", ":"))
+
+            def unstructure_mapping(
+                mapping,
+                _kh=kh,
+                _vh=val_handler,
+                _mapping_cl=unstructure_to or cl,
+            ):
+                seen = {}
+                res = []
+                for k, v in mapping.items():
+                    unstructured_key = _kh(k)
+                    if unstructured_key in seen:
+                        raise MappingKeyCollisionError(
+                            unstructured_key, (seen[unstructured_key], k)
+                        )
+                    seen[unstructured_key] = k
+                    res.append((unstructured_key, v if _vh is None else _vh(v)))
+                return _mapping_cl(res)
+
+            return unstructure_mapping
+
+    if (
+        lossless_keys
+        and key_handler is None
+        and key_base_is_str
+        and lossless_key_arg not in ANIES
+    ):
+        typed_key_handler = converter.get_unstructure_hook(key_arg, cache_result=False)
+
+        def unstructure_string_mapping(
+            mapping,
+            _handler=typed_key_handler,
+            _vh=val_handler,
+            _mapping_cl=unstructure_to or cl,
+        ):
+            seen = {}
+            res = []
+            for k, v in mapping.items():
+                if _handler == identity:
+                    unstructured_key = k
+                else:
+                    unstructured_key = json.dumps(_handler(k), separators=(",", ":"))
+                if unstructured_key in seen:
+                    raise MappingKeyCollisionError(
+                        unstructured_key, (seen[unstructured_key], k)
+                    )
+                seen[unstructured_key] = k
+                res.append((unstructured_key, v if _vh is None else _vh(v)))
+            return _mapping_cl(res)
+
+        return unstructure_string_mapping
+
+    if lossless_keys and key_handler is not None:
+
+        def unstructure_mapping_with_explicit_keys(
+            mapping,
+            _kh=kh,
+            _vh=val_handler,
+            _mapping_cl=unstructure_to or cl,
+        ):
+            seen = {}
+            res = []
+            for k, v in mapping.items():
+                unstructured_key = _kh(k)
+                if unstructured_key in seen:
+                    raise MappingKeyCollisionError(
+                        unstructured_key, (seen[unstructured_key], k)
+                    )
+                seen[unstructured_key] = k
+                res.append((unstructured_key, v if _vh is None else _vh(v)))
+            return _mapping_cl(res)
+
+        return unstructure_mapping_with_explicit_keys
 
     globs = {"__cattr_k_u": kh, "__cattr_v_u": val_handler}
 
@@ -914,17 +1046,21 @@ def mapping_structure_factory(
     key_type=NOTHING,
     val_type=NOTHING,
     detailed_validation: bool | Literal["from_converter"] = "from_converter",
+    lossless_keys: bool | Literal["from_converter"] = False,
 ) -> SimpleStructureHook[Mapping[Any, Any], T]:
     """Generate a specialized structure function for a mapping."""
     fn_name = "structure_mapping"
 
     if detailed_validation == "from_converter":
         detailed_validation = converter.detailed_validation
+    if lossless_keys == "from_converter":
+        lossless_keys = getattr(converter, "lossless_mapping_keys", False)
 
-    globs: dict[str, type] = {"__cattr_mapping_cl": structure_to}
+    globs: dict[str, Any] = {"__cattr_mapping_cl": structure_to}
 
     lines = []
     internal_arg_parts = {}
+    type_lossless_keys = False
 
     # Let's try fishing out the type args.
     if not is_bare(cl):
@@ -944,6 +1080,8 @@ def mapping_structure_factory(
                 # Probably a Counter
                 (key_type,) = args
                 val_type = Any
+
+        type_lossless_keys = lossless_keys and key_type not in ANIES
 
         is_bare_dict = val_type in ANIES and key_type in ANIES
         if not is_bare_dict:
@@ -970,6 +1108,32 @@ def mapping_structure_factory(
                 if val_handler != val_type
                 else "__cattr_v_s(v)"
             )
+            key_base = get_newtype_base(key_type) or key_type
+            custom_string_hook = (
+                type_lossless_keys
+                and is_subclass(key_base, str)
+                and not (is_subclass(key_type, Enum) and key_handler == identity)
+            )
+            if type_lossless_keys and (
+                not is_subclass(key_base, str) or custom_string_hook
+            ):
+
+                def decode_mapping_key(
+                    key,
+                    key_type=key_type,
+                    key_handler=key_handler,
+                    call_handler=key_handler != key_type,
+                ):
+                    if isinstance(key, str) and (
+                        not is_subclass(key_type, str) or custom_string_hook
+                    ):
+                        key = _load_json_key(key)
+                    return (
+                        key_handler(key, key_type) if call_handler else key_handler(key)
+                    )
+
+                globs["__cattr_k_d"] = decode_mapping_key
+                k_s = "__cattr_k_d(k)"
     else:
         is_bare_dict = True
 
@@ -980,6 +1144,10 @@ def mapping_structure_factory(
         if detailed_validation:
             internal_arg_parts["IterableValidationError"] = IterableValidationError
             internal_arg_parts["IterableValidationNote"] = IterableValidationNote
+            if type_lossless_keys:
+                internal_arg_parts["MappingKeyCollisionError"] = (
+                    MappingKeyCollisionError
+                )
             internal_arg_parts["val_type"] = (
                 val_type if val_type is not NOTHING else Any
             )
@@ -989,6 +1157,8 @@ def mapping_structure_factory(
             globs["enumerate"] = enumerate
 
             lines.append("  res = {}; errors = []")
+            if type_lossless_keys:
+                lines.append("  seen = {}")
             lines.append("  for k, v in mapping.items():")
             lines.append("    try:")
             lines.append(f"      value = {v_s}")
@@ -1000,6 +1170,12 @@ def mapping_structure_factory(
             lines.append("      continue")
             lines.append("    try:")
             lines.append(f"      key = {k_s}")
+            if type_lossless_keys:
+                lines.append("      if key in seen:")
+                lines.append(
+                    "        raise MappingKeyCollisionError(key, (seen[key], k))"
+                )
+                lines.append("      seen[key] = k")
             lines.append("      res[key] = value")
             lines.append("    except Exception as e:")
             lines.append(
@@ -1011,7 +1187,22 @@ def mapping_structure_factory(
                 f"    raise IterableValidationError('While structuring ' + {repr(cl)!r}, errors, __cattr_mapping_cl)"
             )
         else:
-            lines.append(f"  res = {{{k_s}: {v_s} for k, v in mapping.items()}}")
+            if type_lossless_keys:
+                internal_arg_parts["MappingKeyCollisionError"] = (
+                    MappingKeyCollisionError
+                )
+                lines.append("  res = {}")
+                lines.append("  seen = {}")
+                lines.append("  for k, v in mapping.items():")
+                lines.append(f"    key = {k_s}")
+                lines.append("    if key in seen:")
+                lines.append(
+                    "      raise MappingKeyCollisionError(key, (seen[key], k))"
+                )
+                lines.append("    seen[key] = k")
+                lines.append(f"    res[key] = {v_s}")
+            else:
+                lines.append(f"  res = {{{k_s}: {v_s} for k, v in mapping.items()}}")
     if structure_to is not dict:
         lines.append("  res = __cattr_mapping_cl(res)")
 

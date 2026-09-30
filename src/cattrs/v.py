@@ -6,6 +6,7 @@ from .errors import (
     ClassValidationError,
     ForbiddenExtraKeysError,
     IterableValidationError,
+    MappingKeyCollisionError,
 )
 
 __all__ = ["format_exception", "transform_error"]
@@ -25,6 +26,8 @@ def format_exception(exc: BaseException, type: Union[type, None]) -> str:
     """
     if isinstance(exc, KeyError):
         res = "required field missing"
+    elif isinstance(exc, MappingKeyCollisionError):
+        res = f"mapping keys {exc.conflicting_keys!r} collide at {exc.structured_key!r}"
     elif isinstance(exc, ValueError):
         if type is not None:
             tn = type.__name__ if hasattr(type, "__name__") else repr(type)

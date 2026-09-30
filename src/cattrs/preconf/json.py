@@ -34,6 +34,8 @@ def configure_converter(converter: BaseConverter) -> None:
     * datetimes are serialized as ISO 8601
     * counters are serialized as dicts
     * sets are serialized as lists
+    * typed mapping keys are losslessly encoded as strings when
+      ``lossless_mapping_keys`` is enabled
     * string and int enums are passed through when unstructuring
     * union passthrough is configured for unions of strings, bools, ints,
       floats and None

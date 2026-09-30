@@ -111,6 +111,20 @@ class ClassValidationError(BaseValidationError):
         return excs_with_notes, other_excs
 
 
+class MappingKeyCollisionError(ValueError):
+    """Raised when distinct unstructured mapping keys become the same key."""
+
+    structured_key: Any
+    conflicting_keys: tuple[Any, ...]
+
+    def __init__(self, structured_key: Any, conflicting_keys: Sequence[Any]) -> None:
+        self.structured_key = structured_key
+        self.conflicting_keys = tuple(conflicting_keys)
+        super().__init__(
+            f"Mapping keys {self.conflicting_keys!r} both map to {structured_key!r}"
+        )
+
+
 class ForbiddenExtraKeysError(Exception):
     """
     Raised when `forbid_extra_keys` is activated and such extra keys are detected
